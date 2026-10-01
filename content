@@ -1,0 +1,302 @@
+%% run_batch1_all_subjects.m
+% Run the saved SPM25 Batch 1 for all 43 subjects.
+% Batch 1 may contain later dependent modules, but it must include:
+%   1) Convolution modelling
+%   2) Prepare
+% The script repairs Prepare automatically so that it contains exactly:
+%      Set channel type (All -> EEG)
+%      Project EEG sensors to 2D
+
+% For every subject this script:
+%   - finds exactly one aMspmeeg*.mat file;
+%   - creates that subject's own clean E1 onset vector;
+%   - replaces the template dataset and onset vector;
+%   - runs the complete saved batch;
+%   - writes a CSV progress log.
+
+% Existing C-prefixed convolution outputs are skipped to prevent overwrite.
+
+
+clearvars;
+clc;
+
+%% Settings
+rootDir = 'E:\Subjects44\SPM_MAT_DAT';
+expectedSubjects = 43;
+expectedChannels = 63;
+analysisWindowSeconds = [0 0.5];
+skipExistingConvolutionOutput = true;
+
+%% Initialise SPM
+spm('defaults', 'eeg');
+spm_jobman('initcfg');
+
+%% Select the saved Batch 1 MAT file
+[jobName, jobFolder] = uigetfile('*.mat', 'Select the saved Batch 1 MAT file');
+assert(~isequal(jobName, 0), 'No Batch 1 file was selected.');
+
+savedJob = load(fullfile(jobFolder, jobName));
+assert(isfield(savedJob, 'matlabbatch'), ...
+    'The selected MAT file does not contain matlabbatch.');
+templateBatch = savedJob.matlabbatch;
+
+%% Find and validate the Convolution modelling module
+convIndex = [];
+prepareIndex = [];
+
+for moduleNumber = 1:numel(templateBatch)
+    oneModule = templateBatch{moduleNumber};
+
+    if isfield(oneModule, 'spm') && isfield(oneModule.spm, 'meeg')
+        if isfield(oneModule.spm.meeg, 'modelling') && ...
+                isfield(oneModule.spm.meeg.modelling, 'convmodel')
+            convIndex = moduleNumber;
+        end
+
+        if isfield(oneModule.spm.meeg, 'preproc') && ...
+                isfield(oneModule.spm.meeg.preproc, 'prepare')
+            prepareIndex = moduleNumber;
+        end
+    end
+end
+
+assert(isscalar(convIndex), ...
+    'Batch 1 must contain exactly one Convolution modelling module.');
+assert(isscalar(prepareIndex), ...
+    'Batch 1 must contain exactly one Prepare module.');
+assert(prepareIndex > convIndex, ...
+    'Prepare must come after Convolution modelling.');
+
+convTemplate = templateBatch{convIndex}.spm.meeg.modelling.convmodel;
+assert(numel(convTemplate.sess.cond) == 1, ...
+    'Exactly one condition (all_images) was expected.');
+assert(strcmpi(strtrim(convTemplate.sess.cond(1).name), 'all_images'), ...
+    'The condition name in Batch 1 must be all_images.');
+assert(isfield(convTemplate.sess.cond(1), 'define') && ...
+       isfield(convTemplate.sess.cond(1).define, 'manual'), ...
+    'Condition events must be defined manually.');
+
+%% Repair Prepare automatically
+% Keep its dataset dependency, but replace the task list with the two exact
+% operations required after Convolution modelling. This also removes any
+% accidentally repeated "Set channel types to default" operations.
+setTypeTask = struct;
+setTypeTask.settype.channels = {struct('all', 'all')};
+setTypeTask.settype.newtype = 'EEG';
+
+projectTask = struct;
+projectTask.project3dEEG = 1;
+
+templateBatch{prepareIndex}.spm.meeg.preproc.prepare.task = ...
+    {setTypeTask, projectTask};
+
+fprintf(['Prepare repaired automatically: ' ...
+         'Set channel type (All -> EEG) + Project EEG sensors to 2D.\n']);
+
+%% Find the 43 input datasets
+fileList = dir(fullfile(rootDir, '**', 'aMspmeeg*.mat'));
+fileList = fileList(~[fileList.isdir]);
+
+assert(numel(fileList) == expectedSubjects, ...
+    'Expected %d aMspmeeg*.mat files, but found %d.', ...
+    expectedSubjects, numel(fileList));
+
+% Sort by the last number in the subject folder name when possible.
+subjectNumber = nan(numel(fileList), 1);
+for fileNumber = 1:numel(fileList)
+    [~, subjectFolderName] = fileparts(fileList(fileNumber).folder);
+    numberText = regexp(subjectFolderName, '\d+', 'match');
+    if ~isempty(numberText)
+        subjectNumber(fileNumber) = str2double(numberText{end});
+    end
+end
+
+sortableNumber = subjectNumber;
+sortableNumber(isnan(sortableNumber)) = Inf;
+[~, sortingOrder] = sort(sortableNumber);
+fileList = fileList(sortingOrder);
+subjectNumber = subjectNumber(sortingOrder);
+
+%% Prepare the progress log
+timeStamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+logFile = fullfile(rootDir, ['Batch1_log_' timeStamp '.csv']);
+
+logSubject = strings(expectedSubjects, 1);
+logInput = strings(expectedSubjects, 1);
+logE1Count = nan(expectedSubjects, 1);
+logStatus = strings(expectedSubjects, 1);
+logMessage = strings(expectedSubjects, 1);
+
+fprintf('\nFound %d input datasets.\n', numel(fileList));
+fprintf('Batch template: %s\n', fullfile(jobFolder, jobName));
+fprintf('Progress log: %s\n\n', logFile);
+
+%% Run Batch 1 for every subject
+for fileNumber = 1:numel(fileList)
+    inputFile = fullfile(fileList(fileNumber).folder, fileList(fileNumber).name);
+    pairedDat = fullfile(fileList(fileNumber).folder, ...
+        [fileList(fileNumber).name(1:end-4) '.dat']);
+
+    if isnan(subjectNumber(fileNumber))
+        subjectLabel = string(fileList(fileNumber).folder);
+    else
+        subjectLabel = "sub" + string(subjectNumber(fileNumber));
+    end
+
+    logSubject(fileNumber) = subjectLabel;
+    logInput(fileNumber) = string(inputFile);
+
+    fprintf('\n[%d/%d] %s\n', fileNumber, numel(fileList), subjectLabel);
+    fprintf('Input: %s\n', inputFile);
+
+    try
+        assert(isfile(pairedDat), 'The paired DAT file is missing.');
+
+        D = spm_eeg_load(inputFile);
+        assert(D.nchannels == expectedChannels, ...
+            'Expected %d channels, but found %d.', ...
+            expectedChannels, D.nchannels);
+        assert(D.ntrials == 1, ...
+            'One continuous trial was expected before convolution.');
+
+        tE1_clean = makeCleanE1(D, analysisWindowSeconds);
+        logE1Count(fileNumber) = numel(tE1_clean);
+
+        currentBatch = templateBatch;
+        currentConv = currentBatch{convIndex}.spm.meeg.modelling.convmodel;
+        currentConv.sess.D = {inputFile};
+        currentConv.sess.cond(1).define.manual.onset = tE1_clean;
+        currentConv.sess.cond(1).define.manual.duration = 0;
+        currentBatch{convIndex}.spm.meeg.modelling.convmodel = currentConv;
+
+        convPrefix = char(string(currentConv.prefix));
+        expectedConvOutput = fullfile(fileList(fileNumber).folder, ...
+            [convPrefix fileList(fileNumber).name]);
+
+        if skipExistingConvolutionOutput && isfile(expectedConvOutput)
+            logStatus(fileNumber) = "SKIPPED";
+            logMessage(fileNumber) = ...
+                "The C-prefixed convolution output already exists.";
+            fprintf('SKIPPED: output already exists: %s\n', ...
+                expectedConvOutput);
+        else
+            spm_jobman('run', currentBatch);
+            logStatus(fileNumber) = "PASS";
+            logMessage(fileNumber) = "Batch 1 completed.";
+            fprintf('PASS: %s | clean E1 = %d\n', ...
+                subjectLabel, numel(tE1_clean));
+        end
+
+    catch errorInformation
+        logStatus(fileNumber) = "ERROR";
+        logMessage(fileNumber) = string(errorInformation.message);
+        fprintf(2, 'ERROR: %s\n', errorInformation.message);
+    end
+
+    progressTable = table(logSubject(1:fileNumber), ...
+        logInput(1:fileNumber), logE1Count(1:fileNumber), ...
+        logStatus(1:fileNumber), logMessage(1:fileNumber), ...
+        'VariableNames', {'Subject', 'InputFile', 'CleanE1Count', ...
+                          'Status', 'Message'});
+    writetable(progressTable, logFile);
+
+    clear D currentBatch currentConv tE1_clean;
+end
+
+%% Final report
+finalTable = readtable(logFile, 'TextType', 'string');
+fprintf('\n========== BATCH 1 FINISHED ==========\n');
+fprintf('PASS: %d\n', sum(finalTable.Status == "PASS"));
+fprintf('SKIPPED: %d\n', sum(finalTable.Status == "SKIPPED"));
+fprintf('ERROR: %d\n', sum(finalTable.Status == "ERROR"));
+fprintf('Log file: %s\n', logFile);
+
+
+%% Local functions
+function tE1_clean = makeCleanE1(D, analysisWindowSeconds)
+try
+    eventList = events(D, 1);
+catch
+    eventList = events(D);
+end
+
+assert(~isempty(eventList), 'No events were found in the dataset.');
+
+numberOfEvents = numel(eventList);
+eventTimes = nan(numberOfEvents, 1);
+eventTypes = strings(numberOfEvents, 1);
+eventValues = strings(numberOfEvents, 1);
+
+for eventNumber = 1:numberOfEvents
+    eventTimes(eventNumber) = readEventNumber(eventList(eventNumber), 'time');
+    eventTypes(eventNumber) = readEventText(eventList(eventNumber), 'type');
+    eventValues(eventNumber) = readEventText(eventList(eventNumber), 'value');
+end
+
+normalType = lower(regexprep(strtrim(eventTypes), '[\s_\-]', ''));
+normalValue = lower(regexprep(strtrim(eventValues), '[\s_\-]', ''));
+
+isBoundary = contains(normalType, 'boundary') | ...
+             contains(normalValue, 'boundary');
+isE1 = (normalValue == "e1" | normalType == "e1") & ~isBoundary;
+
+allE1Times = sort(eventTimes(isE1 & isfinite(eventTimes)));
+boundaryTimes = sort(eventTimes(isBoundary & isfinite(eventTimes)));
+assert(~isempty(allE1Times), 'No E1 events were found.');
+
+responseStart = allE1Times + analysisWindowSeconds(1);
+responseEnd = allE1Times + analysisWindowSeconds(2);
+removeE1 = responseStart < D.time(1) | responseEnd > D.time(end);
+
+for boundaryNumber = 1:numel(boundaryTimes)
+    removeE1 = removeE1 | ...
+        (responseStart <= boundaryTimes(boundaryNumber) & ...
+         responseEnd >= boundaryTimes(boundaryNumber));
+end
+
+tE1_clean = double(allE1Times(~removeE1));
+tE1_clean = tE1_clean(:);
+
+assert(~isempty(tE1_clean), ...
+    'No usable E1 events remained after boundary/range checks.');
+assert(all(diff(tE1_clean) > 0), ...
+    'The clean E1 onsets contain duplicates or are not increasing.');
+end
+
+
+function textValue = readEventText(oneEvent, fieldName)
+textValue = "";
+if ~isfield(oneEvent, fieldName) || isempty(oneEvent.(fieldName))
+    return;
+end
+
+fieldValue = oneEvent.(fieldName);
+if iscell(fieldValue)
+    fieldValue = fieldValue{1};
+end
+if isempty(fieldValue)
+    return;
+end
+
+if ischar(fieldValue)
+    textValue = string(fieldValue);
+else
+    textValue = strjoin(string(fieldValue(:)), " ");
+end
+end
+
+
+function numberValue = readEventNumber(oneEvent, fieldName)
+numberValue = NaN;
+if ~isfield(oneEvent, fieldName) || isempty(oneEvent.(fieldName))
+    return;
+end
+
+fieldValue = oneEvent.(fieldName);
+if iscell(fieldValue)
+    fieldValue = fieldValue{1};
+end
+if isnumeric(fieldValue) && ~isempty(fieldValue)
+    numberValue = double(fieldValue(1));
+end
+end
